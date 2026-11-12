@@ -3,8 +3,10 @@
 Тексты резюме и вакансий сюда не передаём: это персональные данные.
 """
 import hashlib
+import json
 import logging
 import time
+from pathlib import Path
 
 import httpx
 
@@ -27,10 +29,14 @@ EVENTS = {
 
 
 class Analytics:
-    def __init__(self, api_key: str, salt: str):
+    def __init__(self, api_key: str, salt: str, local_log: str | None = "data/events.jsonl"):
         self._api_key = api_key
         self._salt = salt
         self._client = httpx.AsyncClient(timeout=10)
+        # Локальная копия событий: источник для reports/unit_economics.py, даже без Amplitude
+        self._local = Path(local_log) if local_log else None
+        if self._local:
+            self._local.parent.mkdir(parents=True, exist_ok=True)
 
     def user_id(self, telegram_id: int) -> str:
         return hashlib.sha256(f"{self._salt}:{telegram_id}".encode()).hexdigest()[:32]
@@ -46,6 +52,9 @@ class Analytics:
             "event_properties": props,
         }
         log.info("event %s %s", event, props)
+        if self._local:
+            with self._local.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=False) + "\n")
         if not self._api_key:
             return
         try:
