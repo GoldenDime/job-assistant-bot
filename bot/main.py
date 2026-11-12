@@ -1,15 +1,15 @@
 """MVP: один сценарий — резюме + вакансия -> адаптированное резюме.
 
-Состояние хранится в памяти процесса: для пилота на 20–30 человек этого хватает,
-после рестарта пользователь просто загружает резюме заново.
+Резюме и вакансия живут в памяти процесса (FSM) и после рестарта теряются —
+пользователь просто загружает их заново. Счётчики для return_session лежат в SQLite.
+Без ключа DeepSeek бот работает в мок-режиме.
 """
 import asyncio
 import logging
 import time
-from dataclasses import dataclass, field
 
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import CommandObject, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -21,9 +21,12 @@ from aiogram.types import (
 )
 
 from .analytics import Analytics
+from . import faithfulness
 from .config import load_config
-from .llm import ResumeAdapter
+from .llm import make_adapter
 from .parsing import MAX_CHARS, ParseError, extract_text
+from .storage import Storage
+from .vacancy import VacancyFetchError, fetch_hh, hh_vacancy_id
 
 logging.basicConfig(level=logging.INFO)
 router = Router()
@@ -36,16 +39,9 @@ class Flow(StatesGroup):
     done = State()
 
 
-@dataclass
-class UserStats:
-    first_seen: float = field(default_factory=time.time)
-    last_vacancy_at: float = 0.0
-    vacancies_total: int = 0
-
-
-stats: dict[int, UserStats] = {}
 analytics: Analytics
-adapter: ResumeAdapter
+adapter = None
+storage: Storage
 
 
 def result_keyboard() -> InlineKeyboardMarkup:
@@ -62,7 +58,7 @@ def result_keyboard() -> InlineKeyboardMarkup:
 @router.message(CommandStart())
 async def start(message: Message, command: CommandObject, state: FSMContext):
     uid = message.from_user.id
-    stats.setdefault(uid, UserStats())
+    storage.get_or_create(analytics.user_id(uid))
     await analytics.track(
         uid,
         "bot_started",
@@ -73,8 +69,21 @@ async def start(message: Message, command: CommandObject, state: FSMContext):
     await message.answer(
         "Привет! Я адаптирую резюме под конкретную вакансию и честно покажу, "
         "чего в нём не хватает. Ничего не выдумываю.\n\n"
-        "Пришлите резюме файлом (PDF, DOCX, TXT) или вставьте текстом."
+        "Пришлите резюме файлом (PDF, DOCX, TXT) или вставьте текстом.\n"
+        "Как обрабатываются данные: /privacy"
     )
+
+
+PRIVACY_TEXT = (
+    "Резюме и вакансия отправляются в модель DeepSeek для обработки и хранятся только в памяти бота "
+    "до его перезапуска. На диск и в аналитику тексты не пишутся: в аналитику уходят только события "
+    "(например, «резюме загружено») с обезличенным id. Уберите из резюме телефон и почту, если не хотите их передавать."
+)
+
+
+@router.message(Command("privacy"))
+async def privacy(message: Message):
+    await message.answer(PRIVACY_TEXT)
 
 
 async def _save_resume(message: Message, state: FSMContext, text: str, fmt: str):
@@ -141,6 +150,7 @@ async def _generate(message: Message, state: FSMContext, uid: int):
         cost_usd=round(result.cost_usd, 6),
         latency_ms=result.latency_ms,
         is_peak=result.is_peak,
+        faithfulness_flags=faithfulness.check(data["resume"], result.text).flags,
     )
     await state.update_data(result=result.text)
     await state.set_state(Flow.done)
@@ -153,23 +163,29 @@ async def _generate(message: Message, state: FSMContext, uid: int):
 @router.message(Flow.vacancy, F.text)
 async def vacancy(message: Message, state: FSMContext):
     uid = message.from_user.id
-    s = stats.setdefault(uid, UserStats())
-    now = time.time()
-    if s.last_vacancy_at and now - s.last_vacancy_at >= 24 * 3600:
+    before, is_return = storage.register_vacancy(analytics.user_id(uid))
+    if is_return:
         await analytics.track(
             uid,
             "return_session",
-            days_since_first=int((now - s.first_seen) // 86400),
-            vacancies_total=s.vacancies_total,
+            days_since_first=int((time.time() - before.first_seen) // 86400),
+            vacancies_total=before.vacancies_total,
         )
-    s.last_vacancy_at = now
-    s.vacancies_total += 1
-    input_type = "link" if message.text.strip().startswith("http") else "text"
-    await analytics.track(uid, "vacancy_submitted", input_type=input_type, site=_detect_site(message.text))
+    text = message.text.strip()
+    input_type = "link" if text.startswith("http") else "text"
+    await analytics.track(uid, "vacancy_submitted", input_type=input_type, site=_detect_site(text))
     if input_type == "link":
-        await message.answer("Ссылки пока не открываю. Вставьте, пожалуйста, текст вакансии.")
-        return
-    await state.update_data(vacancy=message.text[:MAX_CHARS], attempt=1)
+        vid = hh_vacancy_id(text)
+        if not vid:
+            await message.answer("Пока умею открывать только ссылки hh.ru. Вставьте текст вакансии.")
+            return
+        try:
+            text = await fetch_hh(vid)
+        except VacancyFetchError:
+            logging.exception("hh fetch failed")
+            await message.answer("Не получилось открыть вакансию на hh.ru. Вставьте её текст.")
+            return
+    await state.update_data(vacancy=text[:MAX_CHARS], attempt=1)
     await _generate(message, state, uid)
 
 
@@ -208,10 +224,12 @@ async def new_vacancy(cb: CallbackQuery, state: FSMContext):
 
 
 async def main():
-    global analytics, adapter
+    global analytics, adapter, storage
     cfg = load_config()
     analytics = Analytics(cfg.amplitude_api_key, cfg.user_id_salt)
-    adapter = ResumeAdapter(cfg.deepseek_api_key, cfg.deepseek_base_url, cfg.deepseek_model)
+    adapter = make_adapter(cfg.llm_mode, cfg.deepseek_api_key, cfg.deepseek_base_url, cfg.deepseek_model)
+    storage = Storage(cfg.db_path)
+    logging.info("LLM mode: %s, model: %s", cfg.llm_mode, cfg.deepseek_model)
     bot = Bot(cfg.telegram_token)
     dp = Dispatcher()
     dp.include_router(router)
